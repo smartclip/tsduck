@@ -65,6 +65,10 @@ namespace ts {
             //!
             ~Core();
 
+            //========= COMMANDS
+            // The following methods are commands to control tsswitch.
+            // They are called either by the tsswitch main code of the remote command control.
+
             //!
             //! Start the @c tsswitch processing.
             //! @return True on success, false on error.
@@ -98,6 +102,11 @@ namespace ts {
             //!
             void previousInput();
 
+            //========= EVENTS
+            // The following methods are called when input events occur.
+            // They are called either by the input plugins from their respective threads.
+            // The private methods handleWatchDogTimeout() is also an event trigger.
+
             //!
             //! Called by an input plugin when it started an input session.
             //! @param [in] pluginIndex Index of the input plugin.
@@ -121,6 +130,10 @@ namespace ts {
             //!
             bool inputStopped(size_t pluginIndex, bool success);
 
+            //========= BUFFER MANAGEMENT
+            // The following methods are called by the output plugin to get access to
+            // the current input buffer.
+
             //!
             //! Called by the output plugin when it needs some packets to output.
             //! Wait until there is some packets to output.
@@ -142,75 +155,50 @@ namespace ts {
             bool outputSent(size_t pluginIndex, size_t count);
 
         private:
-            // Upon reception of an event (end of input, remote command, etc), there
-            // is a list of actions to execute which depends on the switch policy.
-            // Types of actions (can also be used as bit mask):
-            enum ActionType {
-                NONE            = 0x0001,  // Nothing to do.
-                START           = 0x0002,  // Start a plugin.
-                WAIT_STARTED    = 0x0004,  // Wait for start completion of a plugin.
-                WAIT_INPUT      = 0x0008,  // Wait for input packets on a plugin.
-                STOP            = 0x0010,  // Stop a plugin.
-                WAIT_STOPPED    = 0x0020,  // Wait for stop completion of a plugin.
-                NOTIF_CURRENT   = 0x0040,  // Notify a plugin it is the current one (or not).
-                SET_CURRENT     = 0x0080,  // Set current plugin index.
-                RESTART_TIMEOUT = 0x0100,  // Restart the input timeout on current input.
-                SUSPEND_TIMEOUT = 0x0200,  // Suspend the input timeout on current input.
-                ABORT_INPUT     = 0x0400,  // Abort current input if flags is true.
-            };
+            // State of an input plugin.
+            enum InputState {INPUT_STARTING, INPUT_RUNNING, INPUT_STOPPING, INPUT_STOPPED};
+            typedef std::vector<InputState> InputStateVector;
 
-            // Description of an action with its parameters.
-            class Action: public StringifyInterface
-            {
-            public:
-                ActionType type;   // Action to execute.
-                size_t     index;  // Input plugin index.
-                bool       flag;   // Boolean parameter (depends on the action).
+            // Input switching direction.
+            enum Direction {DOWNWARD, UNCHANGED, UPWARD};
 
-                // Constructor.
-                Action(ActionType t = NONE, size_t i = 0, bool f = false) : type(t), index(i), flag(f) {}
+            // State of the Core object.
+            enum CoreState {CORE_STOPPED, CORE_STARTING_NEXT, CORE_RUNNING, CORE_STOPPING_PREVIOUS};
 
-                // Copy constructor, changing the flag.
-                Action(const Action& other, bool f) : type(other.type), index(other.index), flag(f) {}
-
-                // Implement StringifyInterface.
-                virtual UString toString() const override;
-
-                // Operator "less" for containers.
-                bool operator<(const Action& a) const;
-            };
-
-            typedef std::set<Action> ActionSet;
-            typedef std::deque<Action> ActionQueue;
-
+            // Core private members.
             Options&            _opt;             // Command line options.
             Report&             _log;             // Asynchronous log report.
             InputExecutorVector _inputs;          // Input plugins threads.
             OutputExecutor      _output;          // Output plugin thread.
-            WatchDog            _receiveWatchDog; // Handle reception timeout.
+            WatchDog            _watchDog;        // Handle reception timeout.
             Mutex               _mutex;           // Global mutex, protect access to all subsequent fields.
             Condition           _gotInput;        // Signaled each time an input plugin reports new packets.
+            CoreState           _state;           // State of the tsswitch::Core object.
             size_t              _curPlugin;       // Index of current input plugin.
+            size_t              _nextPlugin;      // Next plugin during switching phase, same as _curPlugin otherwise.
+            size_t              _timeoutPlugin;   // Plugin on which the current timeout applies.
             size_t              _curCycle;        // Current input cycle number.
             volatile bool       _terminate;       // Terminate complete processing.
-            ActionQueue         _actions;         // Sequential queue list of actions to execute.
-            ActionSet           _events;          // Pending events, waiting to be cleared.
+            InputStateVector    _inStates;        // States of input plugins.
 
-            // Names of actions for debug messages.
-            static const Enumeration _actionNames;
+            // Get next input plugin index, either upward or downward.
+            size_t nextInputIndex(size_t index, Direction dir) const;
+
+            // Cancel current timeout. Must be called with mutex held.
+            void cancelTimeout();
+
+            // Restart reception timeout on a specific plugin. Must be called with mutex held.
+            void restartTimeout(size_t index);
+
+            // Start an input session on a plugin thread. Must be called with mutex held.
+            void startPlugin(size_t index, bool flowControl);
+
+            // Stop an input session on a plugin thread. Must be called with mutex held.
+            void stopPlugin(size_t index, bool abortInput);
 
             // Change input plugin with mutex already held.
-            void setInputLocked(size_t index, bool abortCurrent);
-
-            // Enqueue an action (with mutex already held).
-            void enqueue(const Action& action, bool highPriority = false);
-
-            // Remove all instructions with type in bitmask (with mutex already held).
-            void cancelActions(int typeMask);
-
-            // Execute all commands until one needs to wait (with mutex already held).
-            // The event can be used to unlock a wait action.
-            void execute(const Action& event = Action());
+            // In case of error, try next input plugin upward or downward.
+            void setInputLocked(size_t index, bool abortCurrent, Direction dir);
 
             // Implementation of WatchDogHandlerInterface
             virtual void handleWatchDogTimeout(WatchDog& watchdog) override;

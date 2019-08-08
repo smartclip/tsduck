@@ -43,8 +43,7 @@ TSDUCK_SOURCE;
 
 ts::tsswitch::Options::Options(int argc, char *argv[]) :
     ArgsWithPlugins(1, UNLIMITED_COUNT, 0, 0, 0, 1),
-    fastSwitch(false),
-    delayedSwitch(false),
+    _strategy(SEQUENTIAL_SWITCH),
     terminate(false),
     monitor(false),
     logTimeStamp(false),
@@ -187,8 +186,21 @@ ts::tsswitch::Options::Options(int argc, char *argv[]) :
     // Analyze the command.
     analyze(argc, argv);
 
-    fastSwitch = present(u"fast-switch");
-    delayedSwitch = present(u"delayed-switch");
+    // Select switching strategy.
+    if (present(u"delayed-switch") && present(u"fast-switch")) {
+        error(u"options --delayed-switch and --fast-switch are mutually exclusive");
+    }
+    else if (present(u"fast-switch")) {
+        _strategy = FAST_SWITCH;
+    }
+    else if (present(u"delayed-switch")) {
+        _strategy = DELAYED_SWITCH;
+    }
+    else {
+        _strategy = SEQUENTIAL_SWITCH;
+    }
+
+    // Other options.
     terminate = present(u"terminate");
     cycleCount = intValue<size_t>(u"cycle", present(u"infinite") ? 0 : 1);
     monitor = present(u"monitor");
@@ -215,10 +227,6 @@ ts::tsswitch::Options::Options(int argc, char *argv[]) :
 
     if (present(u"cycle") + present(u"infinite") + present(u"terminate") > 1) {
         error(u"options --cycle, --infinite and --terminate are mutually exclusive");
-    }
-
-    if (fastSwitch && delayedSwitch) {
-        error(u"options --delayed-switch and --fast-switch are mutually exclusive");
     }
 
     // Resolve remote control name.

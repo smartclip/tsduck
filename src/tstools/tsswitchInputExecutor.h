@@ -79,9 +79,11 @@ namespace ts {
 
             //!
             //! Tell the input executor thread to start an input session.
-            //! @param [in] isCurrent True if the plugin immediately becomes the current one.
+            //! @param [in] flowControl True if the plugin shall ensure that all input packets are safely
+            //! transmitted to the output plugin. When false, the plugin continuously overwrites (drop) older
+            //! packets in the buffer.
             //!
-            void startInput(bool isCurrent);
+            void startInput(bool flowControl);
 
             //!
             //! Tell the input executor thread to stop its input session.
@@ -90,10 +92,13 @@ namespace ts {
             void stopInput();
 
             //!
-            //! Notify the input executor thread that it becomes or is no longer the current input plugin.
-            //! @param [in] isCurrent True if the plugin becomes the current one.
+            //! Notify the input executor thread of the flow control policy to use.
+            //! Typically used when it becomes or is no longer the current input plugin.
+            //! @param [in] flowControl True if the plugin shall ensure that all input packets are safely
+            //! transmitted to the output plugin. When false, the plugin continuously overwrites (drop) older
+            //! packets in the buffer.
             //!
-            void setCurrent(bool isCurrent);
+            void setFlowControl(bool flowControl);
 
             //!
             //! Terminate the input executor thread.
@@ -135,11 +140,11 @@ namespace ts {
             TSPacketMetadataVector _metadata; // Packet metadata.
             Mutex          _mutex;            // Mutex to protect all subsequent fields.
             Condition      _todo;             // Condition to signal something to do.
-            bool           _isCurrent;        // This plugin is the current input one.
+            bool           _flowControl;      // Do not lose input packet, this plugin is probably the current input one.
             bool           _outputInUse;      // The output part of the buffer is currently in use by the output plugin.
-            bool           _startRequest;     // Start input requested.
-            bool           _stopRequest;      // Stop input requested.
-            bool           _terminated;       // Terminate thread.
+            volatile bool  _terminated;       // Terminate thread. Can only go from false to true, never revert back to false.
+            size_t         _startRequests;    // Number of pending start input requests.
+            size_t         _stopRequests;     // Number of pending stop input requests.
             size_t         _outFirst;         // Index of first packet to output in _buffer.
             size_t         _outCount;         // Number of packets to output, not always contiguous, may wrap up.
 

@@ -42,6 +42,15 @@ namespace ts {
     //!
     namespace tsswitch {
         //!
+        //! Input plugins switching strategies.
+        //!
+        enum SwitchingStrategy {
+            SEQUENTIAL_SWITCH,  //!< Purely sequential, start a plugin after complete stop of the previous one.
+            DELAYED_SWITCH,     //!< Keep previous plugin running while starting the next one, switch when fully started.
+            FAST_SWITCH,        //!< Keep all plugin running at all times.
+        };
+
+        //!
         //! Input switch (tsswitch) command-line options.
         //! @ingroup plugin
         //!
@@ -49,8 +58,7 @@ namespace ts {
         {
             TS_NOBUILD_NOCOPY(Options);
         public:
-            bool          fastSwitch;        //!< Fast switch between input plugins.
-            bool          delayedSwitch;     //!< Delayed switch between input plugins.
+            SwitchingStrategy _strategy;     //!< Switching strategy.
             bool          terminate;         //!< Terminate when one input plugin completes.
             bool          monitor;           //!< Run a resource monitoring thread.
             bool          logTimeStamp;      //!< Add time stamps in log messages.

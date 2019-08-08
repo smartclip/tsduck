@@ -40,6 +40,7 @@ TSDUCK_SOURCE;
 ts::tsswitch::OutputExecutor::OutputExecutor(Core& core, Options& opt, Report& log) :
     PluginThread(&opt, opt.appName(), opt.outputs[0], ThreadAttributes()),
     _core(core),
+    _opt(opt),
     _output(dynamic_cast<OutputPlugin*>(plugin())),
     _terminate(false)
 {
@@ -81,7 +82,7 @@ bool ts::tsswitch::OutputExecutor::thisJointTerminated() const
 
 void ts::tsswitch::OutputExecutor::main()
 {
-    debug(u"output thread started");
+    debug(u"OutputExecutor: output thread started");
 
     size_t pluginIndex = 0;
     TSPacket* first = nullptr;
@@ -104,7 +105,7 @@ void ts::tsswitch::OutputExecutor::main()
                 addPluginPackets(count);
             }
             else {
-                debug(u"stopping output plugin");
+                debug(u"OutputExecutor: stopping output plugin");
                 _core.stop(false);
                 _terminate = true;
             }
@@ -113,5 +114,5 @@ void ts::tsswitch::OutputExecutor::main()
 
     // Stop the plugin.
     _output->stop();
-    debug(u"output thread terminated");
+    debug(u"OutputExecutor: output thread terminated, %d packets", {pluginPackets()});
 }

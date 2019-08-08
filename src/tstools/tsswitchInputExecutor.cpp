@@ -49,11 +49,11 @@ ts::tsswitch::InputExecutor::InputExecutor(size_t index, Core& core, Options& op
     _metadata(opt.bufferedPackets),
     _mutex(),
     _todo(),
-    _isCurrent(false),
+    _flowControl(false),
     _outputInUse(false),
-    _startRequest(false),
-    _stopRequest(false),
     _terminated(false),
+    _startRequests(0),
+    _stopRequests(0),
     _outFirst(0),
     _outCount(0)
 {
@@ -95,14 +95,13 @@ bool ts::tsswitch::InputExecutor::thisJointTerminated() const
 // Start input.
 //----------------------------------------------------------------------------
 
-void ts::tsswitch::InputExecutor::startInput(bool isCurrent)
+void ts::tsswitch::InputExecutor::startInput(bool flowControl)
 {
-    debug(u"received start request, current: %s", {isCurrent});
+    debug(u"InputExecutor: received start request, flow control: %s", {flowControl});
 
     GuardCondition lock(_mutex, _todo);
-    _isCurrent = isCurrent;
-    _startRequest = true;
-    _stopRequest = false;
+    _flowControl = flowControl;
+    _startRequests++;
     lock.signal();
 }
 
@@ -116,20 +115,19 @@ void ts::tsswitch::InputExecutor::stopInput()
     debug(u"received stop request");
 
     GuardCondition lock(_mutex, _todo);
-    _startRequest = false;
-    _stopRequest = true;
+    _stopRequests++;
     lock.signal();
 }
 
 
 //----------------------------------------------------------------------------
-// Set/reset as current input plugin. Do not start or stop it.
+// Notify the input executor thread of the flow control policy to use.
 //----------------------------------------------------------------------------
 
-void ts::tsswitch::InputExecutor::setCurrent(bool isCurrent)
+void ts::tsswitch::InputExecutor::setFlowControl(bool flowControl)
 {
     Guard lock(_mutex);
-    _isCurrent = isCurrent;
+    _flowControl = flowControl;
 }
 
 
@@ -183,45 +181,69 @@ void ts::tsswitch::InputExecutor::freeOutput(size_t count)
 
 void ts::tsswitch::InputExecutor::main()
 {
-    debug(u"input thread started");
+    debug(u"InputExecutor: input thread started");
+
+    // Success of the last start and stop operations.
+    bool startStatus = false;
+    bool stopStatus = false;
 
     // Main loop. Each iteration is a complete input session.
     for (;;) {
 
-        // Initial sequence under mutex protection.
-        debug(u"waiting for input session");
-        {
+        // First part: notify previous stop, wait for start request, start, notify start.
+        // Loop until terminate request or successful session start.
+        // Note that _terminate is volatile and never reverts to false once set.
+        debug(u"InputExecutor: waiting for input session");
+        while (!_terminated && !startStatus) {
+
+            size_t startRequestCount = 0;
+            size_t stopRequestCount = 0;
+
+            // Wait for something to notify or something to do.
+            {
+                // The sequence under mutex protection.
+                GuardCondition lock(_mutex, _todo);
+                // Reset input buffer.
+                _outFirst = 0;
+                _outCount = 0;
+                // Wait for start or terminate.
+                while (_startRequests == 0 && _stopRequests == 0 && !_terminated) {
+                    lock.waitCondition();
+                }
+                startRequestCount = _startRequests;
+                stopRequestCount = _stopRequests;
+            }
+            debug(u"InputExecutor: startRequestCount = %d, stopRequestCount = %d", {startRequestCount, stopRequestCount});
+
+            // Notify a stopped event (we are already stopped) for each stop request.
+            for (size_t i = 0; i < stopRequestCount; i--) {
+                _core.inputStopped(_pluginIndex, stopStatus);
+            }
+
+            // Start the input plugin if requested to do so.
+            if (!_terminated && startRequestCount > 0) {
+                debug(u"InputExecutor: starting input plugin");
+                startStatus = _input->start();
+                debug(u"InputExecutor: input plugin started, status: %s", {startStatus});
+
+                // Notify the tsswitch core of the start.
+                for (size_t i = 0; i < startRequestCount; i--) {
+                    _core.inputStarted(_pluginIndex, startStatus);
+                }
+            }
+
+            // Update global request counters under mutex protection.
             GuardCondition lock(_mutex, _todo);
-            // Reset input buffer.
-            _outFirst = 0;
-            _outCount = 0;
-            // Wait for start or terminate.
-            while (!_startRequest && !_terminated) {
-                lock.waitCondition();
-            }
-            // Exit main loop when termination is requested.
-            if (_terminated) {
-                break;
-            }
-            // At this point, start is requested, reset trigger.
-            _startRequest = false;
-            _stopRequest = false;
+            _startRequests -= startRequestCount;
+            _stopRequests -= stopRequestCount;
         }
 
-        // Here, we need to start an input session.
-        debug(u"starting input plugin");
-        const bool started = _input->start();
-        debug(u"input plugin started, status: %s", {started});
-        _core.inputStarted(_pluginIndex, started);
-
-        if (!started) {
-            // Failed to start.
-            _core.inputStopped(_pluginIndex, false);
-            // Loop back, waiting for a new session.
-            continue;
+        // Exit main loop when termination is requested.
+        if (_terminated) {
+            break;
         }
 
-        // Loop on incoming packets.
+        // Second part: Loop on incoming packets until the end of the session.
         for (;;) {
 
             // Input area (first packet index and packet count).
@@ -232,14 +254,14 @@ void ts::tsswitch::InputExecutor::main()
             {
                 // Wait for free buffer or stop.
                 GuardCondition lock(_mutex, _todo);
-                while (_outCount >= _buffer.size() && !_stopRequest && !_terminated) {
-                    if (_isCurrent || !_opt.fastSwitch) {
-                        // This is the current input, we must not lose packet.
+                while (_outCount >= _buffer.size() && _stopRequests == 0 && !_terminated) {
+                    if (_flowControl) {
+                        // This is typically the current input, we must not lose packet.
                         // Wait for the output thread to free some packets.
                         lock.waitCondition();
                     }
                     else {
-                        // Not the current input plugin in --fast-switch mode.
+                        // Continue input, overwriting old packets.
                         // Drop older packets, free at most --max-input-packets.
                         assert(_outFirst < _buffer.size());
                         const size_t freeCount = std::min(_opt.maxInputPackets, _buffer.size() - _outFirst);
@@ -249,7 +271,7 @@ void ts::tsswitch::InputExecutor::main()
                     }
                 }
                 // Exit input when termination is requested.
-                if (_stopRequest || _terminated) {
+                if (_stopRequests > 0 || _terminated) {
                     break;
                 }
                 // There is some free buffer, compute first index and size of receive area.
@@ -269,9 +291,13 @@ void ts::tsswitch::InputExecutor::main()
             // Receive packets.
             if ((inCount = _input->receive(&_buffer[inFirst], &_metadata[inFirst], inCount)) == 0) {
                 // End of input.
-                debug(u"received end of input from plugin");
+                debug(u"InputExecutor: received end of input from plugin");
+                // Consider it as a stop request.
+                Guard lock(_mutex);
+                _stopRequests++;
                 break;
             }
+            log(10, u"InputExecutor: received %d packets from plugin", {inCount});
             addPluginPackets(inCount);
 
             // Signal the presence of received packets.
@@ -287,8 +313,8 @@ void ts::tsswitch::InputExecutor::main()
             // Wait for the output plugin to release the buffer.
             // In case of normal end of input (no stop, no terminate), wait for all output to be gone.
             GuardCondition lock(_mutex, _todo);
-            while (_outputInUse || (_outCount > 0 && !_stopRequest && !_terminated)) {
-                debug(u"input terminated, waiting for output plugin to release the buffer");
+            while (_outputInUse || (_outCount > 0 && _stopRequests == 0 && !_terminated)) {
+                debug(u"InputExecutor: input terminated, waiting for output plugin to release the buffer");
                 lock.waitCondition();
             }
             // And reset the output part of the buffer.
@@ -297,9 +323,12 @@ void ts::tsswitch::InputExecutor::main()
         }
 
         // End of input session.
-        debug(u"stopping input plugin");
-        _core.inputStopped(_pluginIndex, _input->stop());
+        debug(u"InputExecutor: stopping input plugin");
+        stopStatus = _input->stop();
+        startStatus = false; // no longer started
+
+        // Note: the stop notifications are performed on loopback.
     }
 
-    debug(u"input thread terminated");
+    debug(u"InputExecutor: input thread terminated, %d packets", {pluginPackets()});
 }

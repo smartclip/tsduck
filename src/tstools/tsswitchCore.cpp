@@ -43,14 +43,16 @@ ts::tsswitch::Core::Core(Options& opt, Report& log) :
     _log(log),
     _inputs(_opt.inputs.size(), nullptr),
     _output(*this, opt, log), // load output plugin and analyze options
-    _receiveWatchDog(this, _opt.receiveTimeout, 0, _log),
+    _watchDog(this, _opt.receiveTimeout, 0, _log),
     _mutex(),
     _gotInput(),
+    _state(CORE_STOPPED),
     _curPlugin(_opt.firstInput),
+    _nextPlugin(_curPlugin),
+    _timeoutPlugin(_inputs.size()),
     _curCycle(0),
     _terminate(false),
-    _actions(),
-    _events()
+    _inStates(_opt.inputs.size(), INPUT_STOPPED)
 {
     // Load all input plugins, analyze their options.
     for (size_t i = 0; i < _inputs.size(); ++i) {
@@ -74,358 +76,6 @@ ts::tsswitch::Core::~Core()
         delete _inputs[i];
     }
     _inputs.clear();
-}
-
-
-//----------------------------------------------------------------------------
-// Start the tsswitch processing.
-//----------------------------------------------------------------------------
-
-bool ts::tsswitch::Core::start()
-{
-    // Get all input plugin options.
-    for (size_t i = 0; i < _inputs.size(); ++i) {
-        if (!_inputs[i]->plugin()->getOptions()) {
-            return false;
-        }
-    }
-
-    // Start output plugin.
-    if (!_output.plugin()->getOptions() ||  // Let plugin fetch its command line options.
-        !_output.plugin()->start() ||       // Open the output "device", whatever it means.
-        !_output.start())                   // Start the output thread.
-    {
-        return false;
-    }
-
-    // Start with the designated first input plugin.
-    assert(_opt.firstInput < _inputs.size());
-    _curPlugin = _opt.firstInput;
-
-    // Start all input threads (but do not open the input "devices").
-    bool success = true;
-    for (size_t i = 0; success && i < _inputs.size(); ++i) {
-        // Here, start() means start the thread, not start input plugin.
-        success = _inputs[i]->start();
-    }
-
-    if (!success) {
-        // If one input thread could not start, abort all started threads.
-        stop(false);
-    }
-    else if (_opt.fastSwitch) {
-        // Option --fast-switch, start all plugins, they continue to receive in parallel.
-        for (size_t i = 0; i < _inputs.size(); ++i) {
-            _inputs[i]->startInput(i == _curPlugin);
-        }
-    }
-    else {
-        // Start the first plugin only.
-        _inputs[_curPlugin]->startInput(true);
-
-        // If there is a primary input which is not the first one, start it as well.
-        if (_opt.primaryInput < _inputs.size() && _opt.primaryInput != _curPlugin) {
-            _inputs[_opt.primaryInput]->startInput(false);
-        }
-    }
-
-    return success;
-}
-
-
-//----------------------------------------------------------------------------
-// Stop the tsswitch processing.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::stop(bool success)
-{
-    // Wake up all threads waiting for something on the Switch object.
-    {
-        GuardCondition lock(_mutex, _gotInput);
-        _terminate = true;
-        lock.signal();
-    }
-
-    // Tell the output plugin to terminate.
-    _output.terminateOutput();
-
-    // Tell all input plugins to terminate.
-    for (size_t i = 0; success && i < _inputs.size(); ++i) {
-        _inputs[i]->terminateInput();
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Switch input plugins.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::setInput(size_t index)
-{
-    Guard lock(_mutex);
-    setInputLocked(index, false);
-}
-
-void ts::tsswitch::Core::nextInput()
-{
-    Guard lock(_mutex);
-    setInputLocked((_curPlugin + 1) % _inputs.size(), false);
-}
-
-void ts::tsswitch::Core::previousInput()
-{
-    Guard lock(_mutex);
-    setInputLocked((_curPlugin > 0 ? _curPlugin : _inputs.size()) - 1, false);
-}
-
-
-//----------------------------------------------------------------------------
-// Change input plugin with mutex already held.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::setInputLocked(size_t index, bool abortCurrent)
-{
-    if (index >= _inputs.size()) {
-        _log.warning(u"invalid input index %d", {index});
-    }
-    else if (index != _curPlugin) {
-        _log.debug(u"switch input %d to %d", {_curPlugin, index});
-
-        // The processing depends on the switching mode.
-        if (_opt.delayedSwitch) {
-            // With --delayed-switch, first start the next plugin.
-            // The current plugin will be stopped when the first packet is received in the next plugin.
-            // The primary input is never stopped (and consequently never restarted).
-            enqueue(Action(SUSPEND_TIMEOUT));
-            if (index != _opt.primaryInput) {
-                enqueue(Action(START, index, false));
-            }
-            enqueue(Action(WAIT_INPUT, index));
-            if (_curPlugin == _opt.primaryInput) {
-                enqueue(Action(NOTIF_CURRENT, _curPlugin, false));
-            }
-            enqueue(Action(SET_CURRENT, index));
-            enqueue(Action(NOTIF_CURRENT, index, true));
-            enqueue(Action(RESTART_TIMEOUT));
-            if (_curPlugin != _opt.primaryInput) {
-                enqueue(Action(ABORT_INPUT, _curPlugin, abortCurrent));
-                enqueue(Action(STOP, _curPlugin));
-                enqueue(Action(WAIT_STOPPED, _curPlugin));
-            }
-        }
-        else {
-            // Default switch mode or --fast-switch.
-            // With --fast-switch, don't start/stop plugins. Just inform the plugin that it is current.
-            // The primary input is never stopped (and consequently never restarted).
-            enqueue(Action(SUSPEND_TIMEOUT));
-            if (_opt.fastSwitch || _curPlugin == _opt.primaryInput) {
-                enqueue(Action(NOTIF_CURRENT, _curPlugin, false));
-            }
-            else {
-                enqueue(Action(ABORT_INPUT, _curPlugin, abortCurrent));
-                enqueue(Action(STOP, _curPlugin));
-                enqueue(Action(WAIT_STOPPED, _curPlugin));
-            }
-            enqueue(Action(SET_CURRENT, index));
-            if (_opt.fastSwitch || index == _opt.primaryInput) {
-                enqueue(Action(NOTIF_CURRENT, index, true));
-            }
-            else {
-                enqueue(Action(START, index, true));
-                enqueue(Action(WAIT_STARTED, index));
-            }
-            enqueue(Action(RESTART_TIMEOUT));
-        }
-
-        // Execute actions.
-        execute();
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Invoked when the receive timeout expires.
-// Implementation of WatchDogHandlerInterface.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::handleWatchDogTimeout(WatchDog& watchdog)
-{
-    _log.verbose(u"receive timeout, switching to next plugin");
-
-    Guard lock(_mutex);
-    setInputLocked((_curPlugin + 1) % _inputs.size(), true);
-}
-
-
-//----------------------------------------------------------------------------
-// Names of actions for debug messages.
-//----------------------------------------------------------------------------
-
-const ts::Enumeration ts::tsswitch::Core::_actionNames({
-    {u"NONE",            NONE},
-    {u"START",           START},
-    {u"WAIT_STARTED",    WAIT_STARTED},
-    {u"WAIT_INPUT",      WAIT_INPUT},
-    {u"STOP",            STOP},
-    {u"WAIT_STOPPED",    WAIT_STOPPED},
-    {u"NOTIF_CURRENT",   NOTIF_CURRENT},
-    {u"SET_CURRENT",     SET_CURRENT},
-    {u"RESTART_TIMEOUT", RESTART_TIMEOUT},
-    {u"SUSPEND_TIMEOUT", SUSPEND_TIMEOUT},
-    {u"ABORT_INPUT",     ABORT_INPUT}
-});
-
-
-//----------------------------------------------------------------------------
-// Stringify an Action object.
-//----------------------------------------------------------------------------
-
-ts::UString ts::tsswitch::Core::Action::toString() const
-{
-    return UString::Format(u"%s, %d, %s", {_actionNames.name(type), index, flag});
-}
-
-
-//----------------------------------------------------------------------------
-// Operator "less" for containers of Action objects.
-//----------------------------------------------------------------------------
-
-bool ts::tsswitch::Core::Action::operator<(const Action& a) const
-{
-    if (type != a.type) {
-        return type < a.type;
-    }
-    else if (index != a.index) {
-        return index < a.index;
-    }
-    else {
-        return int(flag) < int(a.flag);
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Enqueue an action.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::enqueue(const Action& action, bool highPriority)
-{
-    _log.debug(u"enqueue action %s", {action});
-    if (highPriority) {
-        _actions.push_front(action);
-    }
-    else {
-        _actions.push_back(action);
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Remove all instructions with type in bitmask.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::cancelActions(int typeMask)
-{
-    for (ActionQueue::iterator it = _actions.begin(); it != _actions.end(); ) {
-        // Check if the current action is one that must be removed.
-        if ((int(it->type) & typeMask) != 0) {
-            // Yes, remove instruction.
-            it = _actions.erase(it);
-        }
-        else {
-            // No, keep it and move to next action.
-            ++it;
-        }
-    }
-}
-
-
-//----------------------------------------------------------------------------
-// Execute all commands until one needs to wait.
-//----------------------------------------------------------------------------
-
-void ts::tsswitch::Core::execute(const Action& event)
-{
-    // Set current event. Ignore flag in event.
-    const Action eventNoFlag(event, false);
-    if (event.type != NONE && _events.find(eventNoFlag) == _events.end()) {
-        // The event was not present.
-        _events.insert(eventNoFlag);
-        _log.debug(u"setting event: %s", {event});
-    }
-
-    // Loop on all enqueued commands.
-    while (!_actions.empty()) {
-
-        // Inspect front command. Will be dequeued if executed.
-        const Action& action(_actions.front());
-        _log.debug(u"executing action %s", {action});
-        assert(action.index < _inputs.size());
-
-        // Try to execute the front command. Return if wait is required.
-        switch (action.type) {
-            case NONE: {
-                break;
-            }
-            case START: {
-                _inputs[action.index]->startInput(action.flag);
-                break;
-            }
-            case STOP: {
-                if (action.index == _curPlugin) {
-                    // Automatically stop the receive timeout when we stop the current plugin.
-                    _receiveWatchDog.suspend();
-                }
-                _inputs[action.index]->stopInput();
-                break;
-            }
-            case ABORT_INPUT: {
-                // Abort only if flag is set in action.
-                if (action.flag && !_inputs[action.index]->plugin()->abortInput()) {
-                    _log.warning(u"input plugin %s does not support interruption, blocking may occur", {_inputs[action.index]->pluginName()});
-                }
-                break;
-            }
-            case RESTART_TIMEOUT: {
-                _receiveWatchDog.restart();
-                break;
-            }
-            case SUSPEND_TIMEOUT: {
-                _receiveWatchDog.suspend();
-                break;
-            }
-            case NOTIF_CURRENT: {
-                _inputs[action.index]->setCurrent(action.flag);
-                break;
-            }
-            case SET_CURRENT: {
-                _curPlugin = action.index;
-                break;
-            }
-            case WAIT_STARTED:
-            case WAIT_INPUT:
-            case WAIT_STOPPED: {
-                // Wait commands, check if an event of this type is pending.
-                const ActionSet::const_iterator it(_events.find(Action(action, false)));
-                if (it == _events.end()) {
-                    // Event not found, cannot execute further, keep the action in queue and retry later.
-                    _log.debug(u"not ready, waiting: %s", {action});
-                    return;
-                }
-                // Clear the event.
-                _log.debug(u"clearing event: %s", {*it});
-                _events.erase(it);
-                break;
-            }
-            default: {
-                // Unknown action.
-                assert(false);
-            }
-        }
-
-        // Command executed, dequeue it.
-        _actions.pop_front();
-    }
 }
 
 
@@ -479,20 +129,393 @@ bool ts::tsswitch::Core::outputSent(size_t pluginIndex, size_t count)
 
 
 //----------------------------------------------------------------------------
-// Report completion of input start (called by input plugins).
+// Cancel or restart current timeout. Must be called with mutex held.
 //----------------------------------------------------------------------------
 
-bool ts::tsswitch::Core::inputStarted(size_t pluginIndex, bool success)
+void ts::tsswitch::Core::cancelTimeout()
+{
+    _timeoutPlugin = _inputs.size();
+    _watchDog.suspend();
+}
+
+void ts::tsswitch::Core::restartTimeout(size_t index)
+{
+    _timeoutPlugin = index;
+    _watchDog.restart();
+}
+
+
+//----------------------------------------------------------------------------
+// Start or stop an input plugin. Must be called with mutex held.
+//----------------------------------------------------------------------------
+
+void ts::tsswitch::Core::startPlugin(size_t index, bool flowControl)
+{
+    assert(index < _inputs.size());
+    _log.debug(u"Core: starting plugin %d", {index});
+
+    _inStates[index] = INPUT_STARTING;
+    _inputs[index]->startInput(flowControl);
+}
+
+void ts::tsswitch::Core::stopPlugin(size_t index, bool abortInput)
+{
+    assert(index < _inputs.size());
+    _log.debug(u"Core: stopping plugin %d", {index});
+
+    _inStates[index] = INPUT_STOPPING;
+    // Abort current input operation if requested. This is immediate, no wait.
+    if (abortInput && !_inputs[index]->plugin()->abortInput()) {
+        _log.warning(u"input plugin %s does not support interruption, blocking may occur", {_inputs[index]->pluginName()});
+    }
+    _inputs[index]->stopInput();
+}
+
+
+//----------------------------------------------------------------------------
+// Start the tsswitch processing.
+//----------------------------------------------------------------------------
+
+bool ts::tsswitch::Core::start()
+{
+    // Must be stopped to start.
+    if (_state != CORE_STOPPED) {
+        _log.error(u"wrong switch core state %d, cannot start", {_state});
+        return false;
+    }
+
+    // Get all input plugin options.
+    for (size_t i = 0; i < _inputs.size(); ++i) {
+        if (!_inputs[i]->plugin()->getOptions()) {
+            return false;
+        }
+    }
+
+    // Start output plugin.
+    if (!_output.plugin()->getOptions() ||  // Let plugin fetch its command line options.
+        !_output.plugin()->start() ||       // Open the output "device", whatever it means.
+        !_output.start())                   // Start the output thread.
+    {
+        return false;
+    }
+
+    // Start with the designated first input plugin.
+    assert(_opt.firstInput < _inputs.size());
+    _curPlugin = _nextPlugin = _opt.firstInput;
+
+    // Start all input threads (but do not open the input "devices").
+    for (size_t i = 0; i < _inputs.size(); ++i) {
+        // Here, start() means start the thread, not start input plugin.
+        if (!_inputs[i]->start()) {
+            // If one input thread could not start, abort all started threads.
+            stop(false);
+            return false;
+        }
+    }
+
+    if (_opt._strategy == FAST_SWITCH) {
+        // Option --fast-switch, start all plugins, they continue to receive in parallel.
+        for (size_t i = 0; i < _inputs.size(); ++i) {
+            // Flow control is enabled for the current and primary input plugin (if there is one).
+            // If the primary is defined and produces input, it will rapidly become the current
+            // plugin (after the first input) and the initial current one will immediately drop
+            // flow control.
+            startPlugin(i, i == _curPlugin || i == _opt.primaryInput);
+        }
+    }
+    else {
+        // Start the first plugin only.
+        startPlugin(_curPlugin, true);
+
+        // If there is a primary input which is not the first one, start it as well.
+        // See comment above about flow control.
+        if (_opt.primaryInput < _inputs.size() && _opt.primaryInput != _curPlugin) {
+            startPlugin(_opt.primaryInput, true);
+        }
+    }
+
+    _state = CORE_STARTING_NEXT;
+    return true;
+}
+
+
+//----------------------------------------------------------------------------
+// Stop the tsswitch processing.
+//----------------------------------------------------------------------------
+
+void ts::tsswitch::Core::stop(bool success)
+{
+    // Wake up all threads waiting for something on the tsswitch::Core object.
+    {
+        GuardCondition lock(_mutex, _gotInput);
+        _terminate = true;
+        lock.signal();
+    }
+
+    // Tell the output plugin to terminate.
+    _output.terminateOutput();
+
+    // Tell all input plugins to terminate.
+    for (size_t i = 0; success && i < _inputs.size(); ++i) {
+        _inputs[i]->terminateInput();
+        _inStates[i] = INPUT_STOPPED;
+    }
+
+    _state = CORE_STOPPED;
+}
+
+
+//----------------------------------------------------------------------------
+// Get next input plugin index, either upward or downward.
+//----------------------------------------------------------------------------
+
+size_t ts::tsswitch::Core::nextInputIndex(size_t index, Direction dir) const
+{
+    switch (dir) {
+        case UPWARD:
+            return (index + 1) % _inputs.size();
+        case DOWNWARD:
+            return index > 0 ? index - 1 : _inputs.size() - 1;
+        case UNCHANGED:
+            return index;
+        default:
+            assert(false);          // should not get there
+            return _inputs.size();  // invalid value
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Switch input plugins.
+//----------------------------------------------------------------------------
+
+void ts::tsswitch::Core::setInput(size_t index)
+{
+    Guard lock(_mutex);
+    setInputLocked(index, false, UNCHANGED);
+}
+
+// For next and previous commands, use _nextPlugin and not _curPlugin.
+// When the two are different, we are in a switching phase and,
+// in that case, _nextPlugin is the last selected one by the user.
+
+void ts::tsswitch::Core::nextInput()
+{
+    Guard lock(_mutex);
+    setInputLocked(nextInputIndex(_nextPlugin, UPWARD), false, UPWARD);
+}
+
+void ts::tsswitch::Core::previousInput()
+{
+    Guard lock(_mutex);
+    setInputLocked(nextInputIndex(_nextPlugin, DOWNWARD), false, DOWNWARD);
+}
+
+
+//----------------------------------------------------------------------------
+// Change input plugin with mutex already held.
+//----------------------------------------------------------------------------
+
+void ts::tsswitch::Core::setInputLocked(size_t index, bool abortCurrent, Direction dir)
+{
+    if (index == _nextPlugin) {
+        // We are already switching to this one.
+        return;
+    }
+
+    if (index >= _inputs.size()) {
+        _log.warning(u"invalid input index %d", {index});
+        return;
+    }
+
+    // Check core state. We can switch only when we are stable.
+    switch (_state) {
+        case CORE_RUNNING:
+            // Correct state, can continue.
+            _log.debug(u"Core: switching input %d to %d", {_nextPlugin, index});
+            break;
+        case CORE_STARTING_NEXT:
+            _log.verbose(u"currently starting input %d, cannot switch to plugin %d now, try later", {_nextPlugin, index});
+            return;
+        case CORE_STOPPING_PREVIOUS:
+            _log.verbose(u"currently stopping input %d, cannot switch to plugin %d now, try later", {_curPlugin, index});
+            return;
+        case CORE_STOPPED:
+        default:
+            _log.error(u"wrong switch core state %d, cannot switch to plugin %d", {_state, index});
+            return;
+    }
+
+    // The processing depends on the switching mode.
+    switch (_opt._strategy) {
+        case SEQUENTIAL_SWITCH: {
+            // Stop the current plugin and then start the next one when the current stop is completed.
+            _nextPlugin = index;
+            cancelTimeout();
+            if (_curPlugin == _opt.primaryInput) {
+                // The primary input is never stopped (and consequently never restarted).
+                _state = CORE_STARTING_NEXT;
+                _curPlugin = index;
+                // Directly start the next plugin. This is asynchronous and will be notified by inputStarted().
+                // See you there for the rest of the switching operation.
+                startPlugin(index, true);
+            }
+            else {
+                // Current input is not the primary input, stop it.
+                // This is asynchronous and will be notified by inputStopped().
+                // See you there for the rest of the switching operation.
+                _state = CORE_STOPPING_PREVIOUS;
+                stopPlugin(_curPlugin, abortCurrent);
+            }
+            break;
+        }
+        case DELAYED_SWITCH: {
+            // With delayed switch, first start the next plugin.
+            // The current plugin will be stopped when the first packet is received in the next plugin.
+            _nextPlugin = index;
+            cancelTimeout();
+            if (index == _opt.primaryInput && _inStates[index] == INPUT_RUNNING) {
+                // The primary input is never stopped (and consequently never restarted).
+                // Stop the current plugin. This is asynchronous and will be notified by inputStopped().
+                stopPlugin(_curPlugin, false);
+                // But we are immediately operational for input on the primary.
+                _state = CORE_RUNNING;
+                _curPlugin = index;
+                restartTimeout(index);
+            }
+            else {
+                // Directly start the next plugin. This is asynchronous and will be notified by inputStarted().
+                // See you there for the rest of the switching operation.
+                startPlugin(index, true);
+                _state = CORE_STARTING_NEXT;
+            }
+            break;
+        }
+        case FAST_SWITCH: {
+            // With fast switching, there is no switching phase, current and next are always identical.
+            assert(_curPlugin == _nextPlugin);
+            // Make sure the target plugin is started (can be in startup phase or plugin could not start).
+            // If not started, automatically switch to next one.
+            size_t target = index;
+            while (_inStates[target] != INPUT_RUNNING) {
+                if (dir == UNCHANGED) {
+                    // Don't try another one.
+                    _log.warning(u"input plugin %d not started", {target});
+                    return;
+                }
+                _log.warning(u"input plugin %d not started, trying next one", {target});
+                target = nextInputIndex(target, dir);
+                if (target == index) {
+                    // Back to the beginning, no plugin is started.
+                    _log.warning(u"no input plugin started, won't switch");
+                    return;
+                }
+            }
+            // Now we know where to switch. Do nothing if you are back to current.
+            if (target != _curPlugin) {
+                _inputs[_curPlugin]->setFlowControl(false);
+                _curPlugin = _nextPlugin = target;
+                _inputs[_curPlugin]->setFlowControl(true);
+                restartTimeout(_curPlugin);
+            }
+            break;
+        }
+        default: {
+            _log.error(u"invalid input switching strategy %d", {_opt._strategy});
+            return;
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------------
+// Invoked when the receive timeout expires.
+// Implementation of WatchDogHandlerInterface.
+//----------------------------------------------------------------------------
+
+void ts::tsswitch::Core::handleWatchDogTimeout(WatchDog& watchdog)
 {
     Guard lock(_mutex);
 
-    // Execute all commands if waiting on this event.
-    execute(Action(WAIT_STARTED, pluginIndex, success));
+    // Filter out spurious call.
+    // May happen when the notification is delivered after the timeout was canceled.
+    if (_timeoutPlugin < _inputs.size()) {
 
-    // Start the receive timeout, if any, when the current input is started.
-    if (pluginIndex == _curPlugin) {
-        _receiveWatchDog.restart();
+        // Check if you are in the middle of a delayed switch.
+        if (_opt._strategy == DELAYED_SWITCH && _state == CORE_STARTING_NEXT && _timeoutPlugin == _nextPlugin) {
+            // We started the next plugin while the current one was still running.
+            // But we could not receive data on this plugin within the timeout.
+            // Stop the plugin (unless this the primary input).
+            if (_nextPlugin != _opt.primaryInput) {
+                stopPlugin(_nextPlugin, true);
+            }
+            // Revert to previous plugin (cancel the switch operation).
+            _nextPlugin = _curPlugin;
+            _state = CORE_RUNNING;
+        }
+
+        // Switch to the next plugin after the one that timed-out.
+        _log.verbose(u"receive timeout, switching to next plugin");
+        setInputLocked(nextInputIndex(_timeoutPlugin, UPWARD), false, UPWARD);
     }
+}
+
+
+//----------------------------------------------------------------------------
+// Report completion of input start (called by input plugins).
+//----------------------------------------------------------------------------
+
+bool ts::tsswitch::Core::inputStarted(size_t index, bool success)
+{
+    assert(index < _inputs.size());
+    _log.debug(u"Core: plugin %d started", {index});
+
+    Guard lock(_mutex);
+
+    // If already started, do nothing. Must be a spurious call.
+    if (_inStates[index] == INPUT_RUNNING) {
+        return !_terminate;
+    }
+
+    // Update plugin states.
+    _inStates[index] = INPUT_RUNNING;
+
+    // If this is not the "next" plugin, then nothing more to do.
+    if (index != _nextPlugin) {
+        // Return false when the application terminates.
+        return !_terminate;
+    }
+
+    // The processing depends on the switching mode.
+    switch (_opt._strategy) {
+        case SEQUENTIAL_SWITCH: {
+            // Stop the current plugin and then start the next one when the current stop is completed.
+            // This is the end of a switching process.
+            _state = CORE_RUNNING;
+            // With sequential switch, the previous plugin was already stopped and the current one is already the starting one.
+            assert(_curPlugin == _nextPlugin);
+            break;
+        }
+        case DELAYED_SWITCH: {
+            // The previous plugin is still running and current.
+            // The next plugin has just started (this notification).
+            // We now wait for input in the next plugin to make it current and stop the previous one.
+            assert(_state == CORE_STARTING_NEXT);
+            break;
+        }
+        case FAST_SWITCH: {
+            // With fast switching, there is no switching phase, current and next are always identical.
+            assert(_curPlugin == _nextPlugin);
+            break;
+        }
+        default: {
+            _log.error(u"invalid input switching strategy %d", {_opt._strategy});
+            return !_terminate;
+        }
+    }
+
+    // Place a timeout on the first input operation.
+    restartTimeout(_curPlugin);
 
     // Return false when the application terminates.
     return !_terminate;
@@ -503,40 +526,50 @@ bool ts::tsswitch::Core::inputStarted(size_t pluginIndex, bool success)
 // Report input reception of packets (called by input plugins).
 //----------------------------------------------------------------------------
 
-bool ts::tsswitch::Core::inputReceived(size_t pluginIndex)
+bool ts::tsswitch::Core::inputReceived(size_t index)
 {
+    assert(index < _inputs.size());
+    _log.log(10, u"Core: input received from plugin %d", {index});
+
     GuardCondition lock(_mutex, _gotInput);
 
-    // Restart the receive timeout, if any, when the current input receives packets.
-    if (pluginIndex == _curPlugin) {
-        _receiveWatchDog.restart();
-    }
-
-    // Execute all commands if waiting on this event. This may change the current input.
-    execute(Action(WAIT_INPUT, pluginIndex));
-
-    // If input is detected on the primary input and the current plugin is not this one
-    // after executing all actions, then automatically switch to it.
-    if (pluginIndex == _opt.primaryInput && _curPlugin != _opt.primaryInput) {
-        // Remove all pending actions.
-        _actions.clear();
-        // Define a new set of actions.
-        enqueue(Action(SUSPEND_TIMEOUT));
-        enqueue(Action(NOTIF_CURRENT, _curPlugin, false));
-        enqueue(Action(SET_CURRENT, _opt.primaryInput));
-        enqueue(Action(NOTIF_CURRENT, _opt.primaryInput, true));
-        enqueue(Action(RESTART_TIMEOUT));
-        if (!_opt.fastSwitch) {
-            enqueue(Action(ABORT_INPUT, _curPlugin, true));
-            enqueue(Action(STOP, _curPlugin));
-            enqueue(Action(WAIT_STOPPED, _curPlugin));
+    // If we receive the first input of the next plugin in a delayed switch, complete the switch operation.
+    if (_opt._strategy == DELAYED_SWITCH && _state == CORE_STARTING_NEXT && index == _nextPlugin) {
+        assert(_curPlugin != _nextPlugin);
+        // Stop the previous plugin if not the primary one.
+        if (_curPlugin != _opt.primaryInput) {
+            stopPlugin(_curPlugin, false);
         }
-        // Execute actions.
-        execute();
-        assert(_curPlugin == _opt.primaryInput);
+        // Switch to next plugin to current.
+        _curPlugin = _nextPlugin;
+        _state = CORE_RUNNING;
     }
 
-    if (pluginIndex == _curPlugin) {
+    // If input is detected on the primary input and the current plugin is not this one, automatically switch to it.
+    if (index == _opt.primaryInput && _curPlugin != _opt.primaryInput) {
+        if (_opt._strategy == FAST_SWITCH) {
+            // With fast switching, simply make the current plugin stop flow control and continuously receive packets.
+            _inputs[_curPlugin]->setFlowControl(false);
+            if (_nextPlugin != _curPlugin && _nextPlugin != index) {
+                _inputs[_nextPlugin]->setFlowControl(false);
+            }
+        }
+        else {
+            // If no fast switching, abort and close all other plugins.
+            for (size_t i = 0; i < _inputs.size(); ++i) {
+                if (i != index && _inStates[i] != INPUT_STOPPING && _inStates[i] != INPUT_STOPPED) {
+                    stopPlugin(i, true);
+                }
+            }
+        }
+        // Make the plugin current.
+        _curPlugin = _nextPlugin = index;
+    }
+
+    // If input is received on the current plugin (maybe after switching to primary input).
+    if (index == _curPlugin) {
+        // Restart the receive timeout.
+        restartTimeout(_curPlugin);
         // Wake up output plugin if it is sleeping, waiting for packets to output.
         lock.signal();
     }
@@ -550,17 +583,28 @@ bool ts::tsswitch::Core::inputReceived(size_t pluginIndex)
 // Report completion of input session (called by input plugins).
 //----------------------------------------------------------------------------
 
-bool ts::tsswitch::Core::inputStopped(size_t pluginIndex, bool success)
+bool ts::tsswitch::Core::inputStopped(size_t index, bool success)
 {
+    assert(index < _inputs.size());
+    _log.debug(u"Core: plugin %d stopped", {index});
+
     bool stopRequest = false;
 
     // Locked sequence.
     {
         Guard lock(_mutex);
-        _log.debug(u"input %d completed, success: %s", {pluginIndex, success});
+        _log.debug(u"Core: input %d completed, success: %s", {index, success});
+
+        // If already stopped, do nothing. Must be a spurious call.
+        if (_inStates[index] == INPUT_STOPPED) {
+            return !_terminate;
+        }
+
+        // Update plugin states.
+        _inStates[index] = INPUT_STOPPED;
 
         // Count end of cycle when the last plugin terminates.
-        if (pluginIndex == _inputs.size() - 1) {
+        if (index == _inputs.size() - 1) {
             _curCycle++;
         }
 
@@ -568,29 +612,44 @@ bool ts::tsswitch::Core::inputStopped(size_t pluginIndex, bool success)
         stopRequest = _opt.terminate || (_opt.cycleCount > 0 && _curCycle >= _opt.cycleCount);
 
         if (stopRequest) {
-            // Need to stop now. Remove any further action, except waiting for termination.
-            cancelActions(~WAIT_STOPPED);
             // Do not trigger receive timeout while terminating.
-            enqueue(Action(SUSPEND_TIMEOUT), true);
+            cancelTimeout();
         }
-        else if (pluginIndex == _curPlugin && _actions.empty()) {
-            // The current plugin terminates and there is nothing else to execute, move to next plugin.
-            const size_t next = (_curPlugin + 1) % _inputs.size();
-            enqueue(Action(SUSPEND_TIMEOUT));
-            enqueue(Action(SET_CURRENT, next));
-            if (_opt.fastSwitch) {
-                // Already started, never stop, simply notify.
-                enqueue(Action(NOTIF_CURRENT, next, true));
+        else {
+            // Not stopping, decide what to do depending on core state.
+            switch (_state) {
+                case CORE_STOPPED: {
+                    // Already stopped, nothing to do.
+                    break;
+                }
+                case CORE_RUNNING: {
+                    // Core normally running, no switch in progress.
+                    // If the current input is terminating, switch to next one.
+                    if (index == _curPlugin) {
+                        setInputLocked(nextInputIndex(index, UPWARD), false, UPWARD);
+                    }
+                    break;
+                }
+                case CORE_STARTING_NEXT: {
+                    // We are in the middle of a switch operation but we do not expect to do anything on a plugin stop.
+                    break;
+                }
+                case CORE_STOPPING_PREVIOUS: {
+                    if (_opt._strategy == SEQUENTIAL_SWITCH && index == _curPlugin) {
+                        // We are in the middle of a delayed switch operation.
+                        // Now start the next plugin.
+                        _state = CORE_STARTING_NEXT;
+                        _curPlugin = _nextPlugin;
+                        startPlugin(_curPlugin, true);
+                    }
+                    break;
+                }
+                default: {
+                    _log.error(u"wrong switch core state %d when plugin %d stopped", {_state, index});
+                    break;
+                }
             }
-            else {
-                enqueue(Action(START, next, true));
-                enqueue(Action(WAIT_STARTED, next));
-            }
-            enqueue(Action(RESTART_TIMEOUT));
         }
-
-        // Execute all commands if waiting on this event.
-        execute(Action(WAIT_STOPPED, pluginIndex));
     }
 
     // Stop everything when we reach the end of the tsswitch processing.

@@ -79,6 +79,7 @@ namespace ts {
 
         private:
             Core&         _core;       // Application core.
+            Options&      _opt;        // Command line options.
             OutputPlugin* _output;     // Plugin API.
             volatile bool _terminate;  // Termination request.
 
