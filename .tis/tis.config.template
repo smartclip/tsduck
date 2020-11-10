@@ -2,7 +2,7 @@
   "name": "TSDuck first analysis",
   "machdep": "gcc_x86_64",
   "cxx-std" : "c++11",
-  "compilation_cmd": " @@INCLUDES@@ ",
+  "compilation_cmd": "-DTS_NO_DTAPI=1 -DTS_NOSRT=1 -DTS_NO_CURL=1 -DTS_NO_PCSC=1 @@INCLUDES@@",
   "files": [@@SOURCES@@],
   "filesystem": {"files": [@@FILESYSTEM@@]}
 }
