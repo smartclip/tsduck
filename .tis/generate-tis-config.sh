@@ -23,7 +23,7 @@ SOURCES=$(
 )
 
 # Generate tis.config in root directory (a poor choice...)
-sed <./.tis/tis.config.template >tis.config \
+sed <.tis/tis.config.template >tis.config \
     -e "s|@@INCLUDES@@|$INCLUDES|" \
     -e "s|@@FILESYSTEM@@|$FILESYSTEM|" \
     -e "s|@@SOURCES@@|$SOURCES|"

@@ -1,7 +1,7 @@
 {
   "name": "TSDuck first analysis",
-  "machdep": "x86_64",
-  "cxx-std" : "cxx11",
+  "machdep": "gcc_x86_64",
+  "cxx-std" : "c++11",
   "compilation_cmd": " @@INCLUDES@@ ",
   "files": [@@SOURCES@@],
   "filesystem": {"files": [@@FILESYSTEM@@]}
